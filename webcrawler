@@ -1,0 +1,300 @@
+#!/usr/bin/python -u
+
+import sys
+import socket
+import urlparse
+from HTMLParser import HTMLParser
+import argparse
+import select
+
+# variables
+HTTP_VERSION = '1.1'
+CRLF = '\r\n\r\n'
+CSRFTOKEN_STR = ''
+CSRF_MIDDLEWARE_TOKEN_STR = ''
+CSRFTOKEN = ''
+COOKIE_STR = ''
+COOKIE = ''
+COOKIE_HEADER = ''
+USERNAME = ''  # 001644612
+PASSWORD = ''  # LJ741YQ0
+PORT = 80
+HOST_URL_STR = 'fring.ccs.neu.edu'
+HOST_HEADER = 'HOST: fring.ccs.neu.edu'
+GET_MSG_NO_HEADERS = 'GET {0} HTTP/{1} {2}'
+GET_MSG = 'GET {0} HTTP/{1} {2}{3} {4}'
+POST_MSG = 'POST {0} HTTP/{1} {2}{3} {4}{5}'
+GOT_LOGIN_COOKIE = False
+PAGES_QUEUE = []
+PAGES_SEEN = []
+HOST_IP = ''
+FLAGS = []
+
+# statements for debugging/stats
+# NUM_200 = 0
+# NUM_500 = 0
+# NUM_301_302 = 0
+# NUM_403_404 = 0
+# NUM_OTHER = 0
+# START_TIME = datetime.datetime.now()
+
+
+# my html parser class with overridden classes
+class MyHTMLParser(HTMLParser):
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            for attr in attrs:
+                if attr[0] == 'href':
+                    if attr[1][0] == '/' and 10 < len(attr[1]) < 40 \
+                            and attr[1] not in PAGES_QUEUE and attr[1] not in PAGES_SEEN:
+                        PAGES_QUEUE.append(attr[1])
+                    elif len(attr[1]) > 40:
+                        raise ValueError(attr[1])
+
+    def handle_data(self, data):
+        if data[0:5] == 'FLAG:':
+            FLAGS.append(data[6:])
+            print data[6:]
+
+
+# parse http to get response code
+class MyHTTPParser:
+    response = ""
+    lines = []
+
+    def __init__(self, http_response):
+        self.response = http_response
+        self.lines = http_response.split('\n')
+
+    # replaces the response of this parser with the given response
+    def feed(self, http_response):
+        self.__init__(http_response)
+
+    # returns the response code of the response
+    def get_response_code(self):
+        words = self.lines[0].split(' ')
+        resp_code = words[1]
+        return resp_code
+
+    # returns the csrftoken and sessionid of the response
+    def get_session_cookie(self):
+        csrftoken_found = False
+        csrftoken = ""
+        sessionid_found = False
+        sessionid = ""
+        for line in self.lines:
+            if line[:10] == 'Set-Cookie':
+                if line[12:21] == 'csrftoken':
+                    csrftoken_found = True
+                    csrftoken = line[22:54]
+                elif line[12:21] == 'sessionid':
+                    sessionid_found = True
+                    sessionid = line[22:54]
+            if csrftoken_found and sessionid_found:
+                break
+        if not csrftoken_found:
+            return sessionid
+        return csrftoken, sessionid
+
+    # returns the response code and headers sections of the response
+    def get_response_minus_html(self):
+        newlines = []
+        for line in self.lines:
+            if line == '':
+                break
+            else:
+                newlines.append(line)
+        return '\n'.join(newlines)
+
+    # returns the key of the given header
+    def get_header_key(self, header):
+        for line in self.lines:
+            if line == '':
+                break
+            words = line.split(' ')
+            if words[0] == header + ':':
+                words.pop(0)
+                return ' '.join(words)
+        return 'key not found'
+
+
+# creates a new socket for fring and connects to it
+def new_socket():
+    new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    new_sock.connect((HOST_IP, PORT))
+    return new_sock
+
+
+# empties the given socket
+def empty_socket(sock):
+    inputs, o, e = select.select([sock], [], [], 0.0)
+    if len(inputs) != 0:
+        sock.recv(65535)
+
+
+HTMLPARSER = MyHTMLParser()
+
+# get arguments
+parser = argparse.ArgumentParser(description='user pass')
+parser.add_argument('networks', metavar='networks', type=str, nargs='+', help="networks")
+args = parser.parse_args()
+USERNAME = args.networks[0]
+PASSWORD = args.networks[1]
+
+# get urls
+LOGIN_URL = urlparse.urlparse("http://fring.ccs.neu.edu/accounts/login/?next=/fakebook/")
+ROOT_URL = urlparse.urlparse("http://fring.ccs.neu.edu/fakebook/")
+
+# connect socket to host
+HOST_IP = socket.gethostbyname(LOGIN_URL.netloc)
+sock = new_socket()
+
+# GET the login page to get the csrftoken and sessionid
+request_str = LOGIN_URL.path + '?' + LOGIN_URL.query
+
+http_login_get = GET_MSG.format(request_str, HTTP_VERSION, '\n', HOST_HEADER, CRLF)
+
+sock.sendall(http_login_get)
+resp1 = sock.recv(65535)
+empty_socket(sock)
+
+# parse the http response to make sure response code is 200
+HTTPPARSER = MyHTTPParser(resp1)
+first_resp_code = HTTPPARSER.get_response_code()
+if first_resp_code != '200':
+    print 'error: unexpected response code\nexpected: 200\nreceived: ' + first_resp_code
+    sys.exit()
+
+# parse the http response to get csrftoken and sessionid and set respective strings
+CSRFTOKEN, COOKIE = HTTPPARSER.get_session_cookie()
+CSRF_MIDDLEWARE_TOKEN_STR = 'csrfmiddlewaretoken=' + CSRFTOKEN
+CSRFTOKEN_STR = 'csrftoken=' + CSRFTOKEN
+COOKIE_STR = 'sessionid=' + COOKIE
+COOKIE_HEADER = 'Cookie: ' + CSRFTOKEN_STR + '; ' + COOKIE_STR + ';'
+
+# POST to login to fakebook
+post_str = 'username=' + USERNAME + '&password=' \
+           + PASSWORD + '&' + CSRF_MIDDLEWARE_TOKEN_STR + '\n'  #+ '&next=%2Ffakebook%2F\n'
+headers = 'Host: ' + HOST_URL_STR + '\n' \
+          + 'Content-Length: ' + str(len(post_str) - 1) + '\n' \
+          + 'Content-Type: application/x-www-form-urlencoded' \
+          + '\n' + COOKIE_HEADER
+
+http_login_post = POST_MSG.format(request_str, HTTP_VERSION,
+                                  '\n', headers, CRLF, post_str)
+
+sock.sendall(http_login_post)
+resp2 = sock.recv(65535)
+empty_socket(sock)
+
+# check for socket error
+if len(resp2) < 7:
+    resp2 = sock.recv(65535)
+
+# get the new sessionid from the response and update cookie/headers
+HTTPPARSER.feed(resp2)
+COOKIE = HTTPPARSER.get_session_cookie()
+COOKIE_STR = 'sessionid=' + COOKIE
+COOKIE_HEADER = 'Cookie: ' + CSRFTOKEN_STR + '; ' + COOKIE_STR + ';'
+headers = 'Host: ' + HOST_URL_STR + '\n' + COOKIE_HEADER + '\n' + 'Connection: Keep-Alive'
+
+# GET the root fakebook page
+http_root_get = GET_MSG.format(ROOT_URL.path, HTTP_VERSION, '\n', headers, CRLF)
+sock.sendall(http_root_get)
+resp3 = sock.recv(65535)
+empty_socket(sock)
+
+# get the links to pages on the root page
+HTMLPARSER.feed(resp3)
+
+# i = 0
+# scans fakebook for the secret flags
+while not len(PAGES_QUEUE) == 0:
+    # i += 1
+    # print i
+    # check to see if 5 flags have been found
+    if len(FLAGS) == 5:
+        break
+
+    # GET the next page in the queue
+    next_page = PAGES_QUEUE.pop(0)
+    PAGES_SEEN.append(next_page)
+    http_next_get = GET_MSG.format(next_page, HTTP_VERSION, '\n', headers, CRLF)
+    sock.sendall(http_next_get)
+    resp = sock.recv(65535)
+
+    if resp == '0\r\n\r\n':
+        resp = sock.recv(65535)
+
+    # get the response code
+    HTTPPARSER.feed(resp)
+    resp_code = HTTPPARSER.get_response_code()
+    if HTTPPARSER.get_header_key('Keep-Alive') == 'key not found':
+        sock = new_socket()
+        if resp_code != '500':
+            PAGES_QUEUE.insert(0, next_page)
+            continue
+
+    # we got a 200, proceed as normal (scan page for links/flag)
+    if resp_code == '200':
+        # account for chunking
+        last = resp[-8:]
+        if 'html' not in last and '\n0' not in last:
+            sock.settimeout(.001)
+            while True:
+                try:
+                    resp4 = sock.recv(65535)
+                except socket.timeout:
+                    print 'chunking error: next chunk not found'
+                    sys.exit(0)
+                if resp4 != '0\r\n\r\n' and resp4 != '':
+                    resp += resp4
+                    last = resp[-8:]
+                    if 'html' in last or '\n0' in last:
+                        break
+                else:
+                    break
+        sock = new_socket()
+        sock.settimeout(None)
+        empty_socket(sock)
+        # NUM_200 += 1
+        HTMLPARSER.feed(resp)
+    # we didn't get a 200, UH OH
+    elif resp_code == '500':
+        # sock = new_socket()
+        while resp_code == '500':
+            # NUM_500 += 1
+            sock.sendall(http_next_get)
+            new_resp = sock.recv(65535)
+            sock = new_socket()
+            HTTPPARSER.feed(new_resp)
+            resp_code = HTTPPARSER.get_response_code()
+        if resp_code == '200':
+            HTMLPARSER.feed(resp)
+
+    empty_socket(sock)
+    # whether we originally got a 500 or not, we have a 301/302
+    if resp_code == '301' or resp_code == '302':
+        # NUM_301_302 += 1
+        location = HTTPPARSER.get_header_key('Location')
+        if not location == 'key not found':
+            location_url = urlparse.urlparse(location)
+            PAGES_QUEUE.insert(0, location_url.path)
+
+    # elif resp_code == '403' or resp_code == '404':
+        # NUM_403_404 += 1
+
+    # elif resp_code != '200':
+        # NUM_OTHER += 1
+
+# statements for debugging/stats
+# END_TIME = datetime.datetime.now()
+# print 'RESPONSE CODES ENCOUNTERED:'
+# print 'CODE', '#ENC'
+# print ' 200', NUM_200
+# print ' 500', NUM_500
+# print ' 301', NUM_301_302
+# print ' 404', NUM_403_404
+# print 'ELSE', NUM_OTHER
+# print ' TOT', i
+# print '\nTIME RAN:', END_TIME - START_TIME
